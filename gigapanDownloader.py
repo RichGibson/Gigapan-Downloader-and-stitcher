@@ -1,126 +1,141 @@
-#usage: python downloadGigaPan.py <photoid>
-# http://gigapan.org/gigapans/<photoid>>
-# if level is 0, max resolution will be used, try with different levels to see the image resolution to download
-# change imagemagick or outputformat below
-# Project info https://github.com/DeniR/Gigapan-Downloader-and-stitcher
+import click
+import os
+import requests
+import time
+from xml.dom import minidom
+from pathlib import Path
+import pdb
+import math
+import json
 
-from xml.dom.minidom import *
-from urllib2 import *
-from urllib import *
-import sys,os,math,subprocess
 
-outputformat="psb" #psb or tif
-imagemagick="/usr/bin/montage" #Linux path to Imagemagick
-if os.name == "nt":
-  imagemagick="C:\\Program Files\\ImageMagick-6.8.5-Q16\\montage.exe" #Windows path to Imagemagick
+def download_metadata(fmt,photo_id, output_dir):
+    path = output_dir / f"{photo_id}.{fmt}"
+    if path.exists():
+        print(f"{fmt} file already exists: {path}")
+        with open(path, 'r', encoding='utf-8') as f:
+            data = f.read()
+    else:
+        url = f"http://www.gigapan.com/gigapans/{photo_id}.{fmt}"
+        try:
+            print(f"{url=}")
+            response = requests.get(url)
+            data = response.content
+            path.write_bytes(data)
+            print(f"{fmt} saved to: {path}")
+        except Exception as e:
+            print(f"Failed to download {fmt}: {e}")
+            return None
 
-def getText(nodelist):
-    rc = ""
-    for node in nodelist:
-        if node.nodeType == node.TEXT_NODE:
-            rc = rc + node.data
-    return rc
+    if fmt=='json':
+        data = json.loads(data)
+        data=data['gigapan']
+    return data
 
-def find_element_value(e,name):
-    nodelist = [e]
-    while len(nodelist) > 0 :
-        node = nodelist.pop()
-        if node.nodeType == node.ELEMENT_NODE and node.localName == name:
-            return getText(node.childNodes)
+def parse_kml(kml_path):
+    dom = minidom.parse(str(kml_path))
+    width = int(dom.getElementsByTagName("maxWidth")[0].firstChild.data)
+    height = int(dom.getElementsByTagName("maxHeight")[0].firstChild.data)
+    tile_width = int(dom.getElementsByTagName("tileSize")[0].firstChild.data)
+    tile_height = int(dom.getElementsByTagName("tileSize")[0].firstChild.data)
+    return width, height, tile_width, tile_height
+
+def is_valid_jpeg(data):
+    return data.startswith(b'\xff\xd8') and data.endswith(b'\xff\xd9')
+
+def calculate_max_level(pano_width, pano_height, tile_size=256):
+    """ I don't think this will actually work """
+    tiles_x = pano_width / tile_size
+    tiles_y = pano_height / tile_size
+    level_x = math.ceil(math.log2(tiles_x))
+    level_y = math.ceil(math.log2(tiles_y))
+    return max(level_x, level_y)
+
+
+def get_tile_dimensions(pano_width, pano_height, level,  max_level, tile_size=256):
+    """
+    Compute number of tiles in x and y directions at a specific quadtree zoom level.
+    """
+    #max_level=calculate_max_level(pano_width,pano_height, tile_size)
+    
+    scale = 2 ** (max_level - level)
+
+    level_width = pano_width / scale
+    level_height = pano_height / scale
+
+    tiles_x = math.ceil(level_width / tile_size)
+    tiles_y = math.ceil(level_height / tile_size)
+    print(f'{pano_width=}, {pano_height=}, {level=}, {max_level=} {level_width=} {level_height=} {tiles_x=} {tiles_y=}')
+
+    return tiles_x, tiles_y
+
+
+def download_tile(photo_id, level, row, col, output_dir):
+    tile_url = f"http://www.gigapan.com/get_ge_tile/{photo_id}/{level}/{row}/{col}"
+    tile_path = Path(output_dir) / f"{level}/{row}/{col}.jpg"
+    tile_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if tile_path.exists():
+        print(f"Tile already exists: {tile_path}")
+        return tile_path
+
+    try:
+        print(f"Downloading tile: {tile_url} {output_dir}")
+        response = requests.get(tile_url, timeout=40)
+        content = response.content
+
+        if is_valid_jpeg(content) and len(content) > 1000:  # Basic size sanity check
+            tile_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(tile_path, 'wb') as f:
+                f.write(content)
         else:
-            nodelist += node.childNodes
+            raise Exception(f"Invalid or too small JPEG file {tile_path}.")
+    except Exception as e:
+        print(f"Failed to download {tile_url}: {e}")
+        missing_path = Path(output_dir) / "missing_tiles.txt"
+        with open(missing_path, 'a') as f:
+            f.write(f"{level}/{row}/{col}.jpg\n")
 
-    return None
+def download_all_tiles(photo_id, output_dir, level=None):
+    kml_path = download_metadata('kml',  photo_id, output_dir)
+    json_data = download_metadata('json',photo_id, output_dir)
+
+    if level is None:
+        print('fetching all tiles')
+        level=json_data['levels']-1
+        for level in range(level+1):
+            print(f'{level}')
+            cols,rows = get_tile_dimensions(json_data['width'],json_data['height'],level,json_data['levels']-1)
+            for row in range(rows):
+                for col in range(cols):
+                    download_tile(photo_id, level, row, col,  output_dir)
+        return
+
+    if (level > json_data['levels']):
+        level=json_data['levels']-1
+        print(f'Passed level higher than this pano has, so level reset to {level}')
+    
+    cols,rows = get_tile_dimensions(json_data['width'],json_data['height'],level,json_data['levels']-1)
+    for row in range(rows):
+        for col in range(cols):
+            download_tile(photo_id, level, row, col,  output_dir)
+
+@click.command()
+@click.argument('photo_id', type=int)
+@click.argument('zoom_level', required=False, type=int)
+@click.option('-o', '--output', default='tiles', help='Output directory')
+
+def main(photo_id, zoom_level, output):
+
+    if output=='tiles':
+        output=str(photo_id)
+
+    output_dir = Path(output)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    download_all_tiles(photo_id, output_dir, zoom_level)
 
 
-#main
+main()
 
-photo_id = int(sys.argv[1])
-if not os.path.exists(str(photo_id)):
-    os.makedirs(str(photo_id))
-
-base = "http://www.gigapan.org"
-
-# read the kml file
-h = urlopen(base+"/gigapans/%d.kml"%(photo_id))
-photo_kml=h.read()
-
-# find the width and height, level 
-dom = parseString(photo_kml)
-
-maxheight=int(find_element_value(dom.documentElement, "maxHeight"))
-maxwidth=int(find_element_value(dom.documentElement, "maxWidth"))
-tile_size=int(find_element_value(dom.documentElement, "tileSize"))
-maxlevel = max(math.ceil(maxwidth/tile_size), math.ceil(maxheight/tile_size))
-maxlevel = int(math.ceil(math.log(maxlevel)/math.log(2.0)))
-maxwt = int(math.ceil(maxwidth/tile_size))+1
-maxht = int(math.ceil(maxheight/tile_size))+1
-
-# find the width, height, tile number and level to use
-level = int(sys.argv[2])
-if level == 0: 
-  level = maxlevel
-
-width = int(maxwidth / (2 ** (maxlevel-level)))+1
-height = int(maxheight / (2 ** (maxlevel-level)))+1
-wt = int(math.ceil(width/tile_size))+1
-ht = int(math.ceil(height/tile_size))+1
-
-# print the variables
-print '+----------------------------'
-print '| Max size: '+str(maxwidth)+'x'+str(maxheight)+'px'
-print '| Max number of tiles: '+str(maxwt)+'x'+str(maxht)+' tiles = '+str(wt*ht)+' tiles'
-print '| Max level: '+str(maxlevel)
-print '| Tile size: '+str(tile_size)
-print '+----------------------------'
-print '| Image to download:'
-print '| Size: '+str(width)+'x'+str(height)+'px'
-print '| Number of tiles: '+str(wt)+'x'+str(ht)+' tiles = '+str(wt*ht)+' tiles'
-print '| Level: '+str(level)
-print '+----------------------------'
-print
-print 'Starting download...'
-
-errors = 0
-
-#loop around to get every tile
-for j in xrange(ht):
-    for i in xrange(wt):
-        filename = "%04d-%04d.jpg"%(j,i)
-        pathfilename = str(photo_id)+"/"+filename
-        if not os.path.exists(pathfilename) :
-            url = "%s/get_ge_tile/%d/%d/%d/%d"%(base,photo_id, level,j,i)
-            progress = (j)*wt+i+1
-            print '('+str(progress)+'/'+str(wt*ht)+') Downloading '+str(url)+' as '+str(filename)
-            h = urlopen(url)
-            if 200 == h.code :
-                fout = open(pathfilename,"wb")
-                fout.write(h.read())
-                fout.close()
-            else:
-                print '('+str(progress)+'/'+str(wt*ht)+') Downloading error '+str(url)+' http code '+str(h.code)
-                ++errors
-if errors == 0:
-    print "Stitching... "
-    for j in xrange(ht):
-        lineNo = "%04d"%(j)
-        print 'creating line '+ str(lineNo)
-        subprocess.call('"'+imagemagick+'" -depth 8 '+
-                                        '-geometry 256x256+0+0 ' +
-                                        '-mode concatenate ' +
-                                        '-tile '+ str(wt)+'x ' +
-                                        str(photo_id)+'/'+str(lineNo)+'-*.jpg ' +
-                                        str(photo_id)+'/line-'+ str(lineNo) +'.jpg',
-                        shell=True)
-    wline = wt * 256
-    print 'creating output file '
-    subprocess.call('"'+imagemagick+'" -depth 8 '+
-                    '-geometry '+str(wline)+'x256+0+0 ' +
-                    '-mode concatenate ' +
-                    '-tile x'+ str(ht)+' ' +
-                    str(photo_id)+'/line-*.jpg ' +
-                    str(photo_id)+'.'+outputformat,
-                    shell=True)
-    print "OK"
-else:
-    print "Downloading error try running command again"
